@@ -13,6 +13,9 @@ import (
 	"strings"
 	"time"
 
+	capellaApi "github.com/attestantio/go-eth2-client/api/v1/capella"
+	"github.com/attestantio/go-eth2-client/spec/altair"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
@@ -21,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	boostTypes "github.com/flashbots/go-boost-utils/types"
 	"github.com/flashbots/mev-boost/config"
+	"github.com/prysmaticlabs/go-bitfield"
 	"github.com/sirupsen/logrus"
 )
 
@@ -249,4 +253,239 @@ func executionPayloadToBlockHeader(payload *capella.ExecutionPayload) (*types.He
 		BaseFee:         baseFeePerGas,
 		WithdrawalsHash: &withdrawalsHash,
 	}, nil
+}
+
+// =========================== FIBER-BOOST UTILS ===================================== //
+
+func convertBeaconBlockHeader(header *boostTypes.BeaconBlockHeader) *phase0.BeaconBlockHeader {
+	return &phase0.BeaconBlockHeader{
+		Slot:          phase0.Slot(header.Slot),
+		ProposerIndex: phase0.ValidatorIndex(header.ProposerIndex),
+		ParentRoot:    phase0.Root(header.ParentRoot),
+		StateRoot:     phase0.Root(header.StateRoot),
+		BodyRoot:      phase0.Root(header.BodyRoot),
+	}
+}
+
+func convertSignedBeaconBlockHeader(header *boostTypes.SignedBeaconBlockHeader) *phase0.SignedBeaconBlockHeader {
+	return &phase0.SignedBeaconBlockHeader{
+		Message:   convertBeaconBlockHeader(header.Header),
+		Signature: phase0.BLSSignature(header.Signature),
+	}
+}
+
+func convertProposerSlashing(slashing *boostTypes.ProposerSlashing) *phase0.ProposerSlashing {
+	return &phase0.ProposerSlashing{
+		SignedHeader1: convertSignedBeaconBlockHeader(slashing.A),
+		SignedHeader2: convertSignedBeaconBlockHeader(slashing.B),
+	}
+}
+
+func convertAttestationData(data *boostTypes.AttestationData) *phase0.AttestationData {
+	return &phase0.AttestationData{
+		Slot:            phase0.Slot(data.Slot),
+		Index:           phase0.CommitteeIndex(data.Index),
+		BeaconBlockRoot: phase0.Root(data.BlockRoot),
+		Source: &phase0.Checkpoint{
+			Epoch: phase0.Epoch(data.Source.Epoch),
+			Root:  phase0.Root(data.Source.Root),
+		},
+		Target: &phase0.Checkpoint{
+			Epoch: phase0.Epoch(data.Target.Epoch),
+			Root:  phase0.Root(data.Target.Root),
+		},
+	}
+}
+
+func convertAttestation(attestation *boostTypes.Attestation) *phase0.Attestation {
+	return &phase0.Attestation{
+		AggregationBits: bitfield.Bitlist(attestation.AggregationBits),
+		Data:            convertAttestationData(attestation.Data),
+		Signature:       phase0.BLSSignature(attestation.Signature),
+	}
+}
+
+func convertIndexedAttestation(attestation *boostTypes.IndexedAttestation) *phase0.IndexedAttestation {
+	return &phase0.IndexedAttestation{
+		AttestingIndices: attestation.AttestingIndices,
+		Data:             convertAttestationData(attestation.Data),
+		Signature:        phase0.BLSSignature(attestation.Signature),
+	}
+}
+
+func convertAttesterSlashing(slashing *boostTypes.AttesterSlashing) *phase0.AttesterSlashing {
+	return &phase0.AttesterSlashing{
+		Attestation1: &phase0.IndexedAttestation{},
+		Attestation2: &phase0.IndexedAttestation{},
+	}
+}
+
+func convertDeposit(deposit *boostTypes.Deposit) *phase0.Deposit {
+	return &phase0.Deposit{
+		Proof: deposit.Proof,
+		Data: &phase0.DepositData{
+			PublicKey:             phase0.BLSPubKey(deposit.Data.Pubkey),
+			WithdrawalCredentials: deposit.Data.WithdrawalCredentials[:],
+			Amount:                phase0.Gwei(deposit.Data.Amount),
+			Signature:             phase0.BLSSignature(deposit.Data.Signature),
+		},
+	}
+}
+
+func convertVoluntaryExit(exit *boostTypes.SignedVoluntaryExit) *phase0.SignedVoluntaryExit {
+	return &phase0.SignedVoluntaryExit{
+		Signature: phase0.BLSSignature(exit.Signature),
+		Message: &phase0.VoluntaryExit{
+			Epoch:          phase0.Epoch(exit.Message.Epoch),
+			ValidatorIndex: phase0.ValidatorIndex(exit.Message.ValidatorIndex),
+		},
+	}
+}
+
+func convertSyncAggregate(syncAggregate *boostTypes.SyncAggregate) *altair.SyncAggregate {
+	return &altair.SyncAggregate{
+		SyncCommitteeBits:      syncAggregate.CommitteeBits[:],
+		SyncCommitteeSignature: phase0.BLSSignature(syncAggregate.CommitteeSignature),
+	}
+}
+
+func convertBellatrixTransactions(txs []hexutil.Bytes) []bellatrix.Transaction {
+	transactions := make([]bellatrix.Transaction, len(txs))
+
+	for i, v := range txs {
+		transactions[i] = bellatrix.Transaction(v)
+	}
+
+	return transactions
+}
+
+func convertBellatrixPayload(payload *boostTypes.ExecutionPayload) *bellatrix.ExecutionPayload {
+	return &bellatrix.ExecutionPayload{
+		ParentHash:    phase0.Hash32(payload.ParentHash),
+		FeeRecipient:  bellatrix.ExecutionAddress(payload.FeeRecipient),
+		StateRoot:     payload.StateRoot,
+		ReceiptsRoot:  payload.ReceiptsRoot,
+		LogsBloom:     payload.LogsBloom,
+		PrevRandao:    payload.Random,
+		BlockNumber:   payload.BlockNumber,
+		GasLimit:      payload.GasLimit,
+		GasUsed:       payload.GasUsed,
+		Timestamp:     payload.Timestamp,
+		ExtraData:     payload.ExtraData,
+		BaseFeePerGas: payload.BaseFeePerGas,
+		BlockHash:     phase0.Hash32(payload.BlockHash),
+		Transactions:  convertBellatrixTransactions(payload.Transactions),
+	}
+}
+
+// UnblindBellatrixBlock unblinds a blinded Bellatrix beacon block by combining the blinded block with the execution payload
+func UnblindBellatrixBlock(signedBlindedBeaconBlock *boostTypes.SignedBlindedBeaconBlock, executionPayload *boostTypes.ExecutionPayload) *bellatrix.SignedBeaconBlock {
+	signature := phase0.BLSSignature(signedBlindedBeaconBlock.Signature)
+
+	blindedBeaconBlock := signedBlindedBeaconBlock.Message
+
+	randaoReveal := phase0.BLSSignature(blindedBeaconBlock.Body.RandaoReveal)
+
+	eth1Data := &phase0.ETH1Data{
+		DepositRoot:  phase0.Root(blindedBeaconBlock.Body.Eth1Data.DepositRoot),
+		DepositCount: blindedBeaconBlock.Body.Eth1Data.DepositCount,
+		BlockHash:    blindedBeaconBlock.Body.Eth1Data.BlockHash[:],
+	}
+
+	proposerSlashings := make([]*phase0.ProposerSlashing, len(blindedBeaconBlock.Body.ProposerSlashings))
+	for i, v := range blindedBeaconBlock.Body.ProposerSlashings {
+		proposerSlashings[i] = convertProposerSlashing(v)
+	}
+
+	attesterSlashings := make([]*phase0.AttesterSlashing, len(blindedBeaconBlock.Body.AttesterSlashings))
+	for i, v := range blindedBeaconBlock.Body.AttesterSlashings {
+		attesterSlashings[i] = convertAttesterSlashing(v)
+	}
+
+	attestations := make([]*phase0.Attestation, len(blindedBeaconBlock.Body.Attestations))
+	for i, v := range blindedBeaconBlock.Body.Attestations {
+		attestations[i] = convertAttestation(v)
+	}
+
+	deposits := make([]*phase0.Deposit, len(blindedBeaconBlock.Body.Deposits))
+	for i, v := range blindedBeaconBlock.Body.Deposits {
+		deposits[i] = convertDeposit(v)
+	}
+
+	voluntaryExits := make([]*phase0.SignedVoluntaryExit, len(blindedBeaconBlock.Body.VoluntaryExits))
+	for i, v := range blindedBeaconBlock.Body.VoluntaryExits {
+		voluntaryExits[i] = convertVoluntaryExit(v)
+	}
+
+	syncAggregate := convertSyncAggregate(blindedBeaconBlock.Body.SyncAggregate)
+
+	payload := convertBellatrixPayload(executionPayload)
+
+	body := &bellatrix.BeaconBlockBody{
+		RANDAOReveal:      randaoReveal,
+		ETH1Data:          eth1Data,
+		Graffiti:          blindedBeaconBlock.Body.Graffiti,
+		ProposerSlashings: proposerSlashings,
+		AttesterSlashings: attesterSlashings,
+		Attestations:      attestations,
+		Deposits:          deposits,
+		VoluntaryExits:    voluntaryExits,
+		SyncAggregate:     syncAggregate,
+		ExecutionPayload:  payload,
+	}
+
+	block := &bellatrix.BeaconBlock{
+		Slot:          phase0.Slot(blindedBeaconBlock.Slot),
+		ProposerIndex: phase0.ValidatorIndex(blindedBeaconBlock.ProposerIndex),
+		ParentRoot:    phase0.Root(blindedBeaconBlock.ParentRoot),
+		StateRoot:     phase0.Root(blindedBeaconBlock.StateRoot),
+		Body:          body,
+	}
+
+	return &bellatrix.SignedBeaconBlock{
+		Message:   block,
+		Signature: signature,
+	}
+}
+
+// UnblindCapellaBlock unblinds a blinded Capella beacon block by combining the blinded block with the execution payload
+func UnblindCapellaBlock(signedBlindedBeaconBlock *capellaApi.SignedBlindedBeaconBlock, executionPayload *capella.ExecutionPayload) *capella.SignedBeaconBlock {
+	// dataVersion = eth2spec.DataVersionCapella
+	signature := phase0.BLSSignature(signedBlindedBeaconBlock.Signature)
+
+	blindedBeaconBlock := signedBlindedBeaconBlock.Message
+
+	randaoReveal := blindedBeaconBlock.Body.RANDAOReveal
+
+	eth1Data := &phase0.ETH1Data{
+		DepositRoot:  blindedBeaconBlock.Body.ETH1Data.DepositRoot,
+		DepositCount: blindedBeaconBlock.Body.ETH1Data.DepositCount,
+		BlockHash:    blindedBeaconBlock.Body.ETH1Data.BlockHash,
+	}
+
+	body := &capella.BeaconBlockBody{
+		RANDAOReveal:      randaoReveal,
+		ETH1Data:          eth1Data,
+		Graffiti:          blindedBeaconBlock.Body.Graffiti,
+		ProposerSlashings: blindedBeaconBlock.Body.ProposerSlashings,
+		AttesterSlashings: blindedBeaconBlock.Body.AttesterSlashings,
+		Attestations:      blindedBeaconBlock.Body.Attestations,
+		Deposits:          blindedBeaconBlock.Body.Deposits,
+		VoluntaryExits:    blindedBeaconBlock.Body.VoluntaryExits,
+		SyncAggregate:     blindedBeaconBlock.Body.SyncAggregate,
+		ExecutionPayload:  executionPayload,
+	}
+
+	block := &capella.BeaconBlock{
+		Slot:          blindedBeaconBlock.Slot,
+		ProposerIndex: blindedBeaconBlock.ProposerIndex,
+		ParentRoot:    blindedBeaconBlock.ParentRoot,
+		StateRoot:     blindedBeaconBlock.StateRoot,
+		Body:          body,
+	}
+
+	return &capella.SignedBeaconBlock{
+		Message:   block,
+		Signature: signature,
+	}
 }

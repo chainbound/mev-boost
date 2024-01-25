@@ -38,6 +38,8 @@ var (
 	defaultUseSepolia         = os.Getenv("SEPOLIA") != ""
 	defaultUseGoerli          = os.Getenv("GOERLI") != ""
 	defaultUseZhejiang        = os.Getenv("ZHEJIANG") != ""
+	defaultFiberEndpoint      = common.GetEnv("FIBER_ENDPOINT", "beta.fiberapi.io:8080")
+	defaultFiberApiKey        = os.Getenv("FIBER_API_KEY")
 
 	// mev-boost relay request timeouts (see also https://github.com/flashbots/mev-boost/issues/287)
 	defaultTimeoutMsGetHeader         = common.GetEnvInt("RELAY_TIMEOUT_MS_GETHEADER", 950)   // timeout for getHeader requests
@@ -66,6 +68,10 @@ var (
 	relayTimeoutMsRegVal     = flag.Int("request-timeout-regval", defaultTimeoutMsRegisterValidator, "timeout for registerValidator requests [ms]")
 
 	relayRequestMaxRetries = flag.Int("request-max-retries", defaultMaxRetries, "maximum number of retries for a relay get payload request")
+
+	// Fiber config
+	fiberEndpoint = flag.String("fiber-endpoint", defaultFiberEndpoint, "fiber endpoint")
+	fiberApiKey   = flag.String("fiber-api-key", defaultFiberApiKey, "fiber api key")
 
 	// helpers
 	useGenesisForkVersionMainnet  = flag.Bool("mainnet", true, "use Mainnet")
@@ -212,6 +218,9 @@ func Main() {
 		RequestTimeoutGetPayload: time.Duration(*relayTimeoutMsGetPayload) * time.Millisecond,
 		RequestTimeoutRegVal:     time.Duration(*relayTimeoutMsRegVal) * time.Millisecond,
 		RequestMaxRetries:        *relayRequestMaxRetries,
+
+		FiberEndpoint: *fiberEndpoint,
+		FiberApiKey:   *fiberApiKey,
 	}
 	service, err := server.NewBoostService(opts)
 	if err != nil {

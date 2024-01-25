@@ -23,6 +23,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+
+	fiber "github.com/chainbound/fiber-go"
 )
 
 var (
@@ -69,6 +71,9 @@ type BoostServiceOpts struct {
 	RequestTimeoutGetPayload time.Duration
 	RequestTimeoutRegVal     time.Duration
 	RequestMaxRetries        int
+
+	FiberEndpoint string
+	FiberApiKey   string
 }
 
 // BoostService - the mev-boost service
@@ -92,6 +97,8 @@ type BoostService struct {
 
 	slotUID     *slotUID
 	slotUIDLock sync.Mutex
+
+	fiberClient *fiber.Client
 }
 
 // NewBoostService created a new BoostService
@@ -103,6 +110,28 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 	builderSigningDomain, err := ComputeDomain(types.DomainTypeAppBuilder, opts.GenesisForkVersionHex, types.Root{}.String())
 	if err != nil {
 		return nil, err
+	}
+
+	fiberClient := fiber.NewClient(opts.FiberEndpoint, opts.FiberApiKey)
+
+	// If Fiber is enabled, connect to the Fiber Network, otherwise warn the user
+	// that Fiber is disabled and leave fiberClient as nil.
+	if opts.FiberApiKey == "" || opts.FiberEndpoint == "" {
+		opts.Log.Info("Fiber API key or endpoint not set, disabling Fiber")
+		// Set fiberClient = nil
+		fiberClient = nil
+	} else {
+		// Try to connect to the Fiber Network. If unsuccessful, return an error.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := fiberClient.Connect(ctx); err != nil {
+			return nil, err
+		}
+
+		opts.Log.WithFields(logrus.Fields{
+			"endpoint": opts.FiberEndpoint,
+			"key":      opts.FiberApiKey,
+		}).Info("FiberBoost connected")
 	}
 
 	return &BoostService{
@@ -129,6 +158,8 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 			CheckRedirect: httpClientDisallowRedirects,
 		},
 		requestMaxRetries: opts.RequestMaxRetries,
+
+		fiberClient: fiberClient,
 	}, nil
 }
 
@@ -605,6 +636,20 @@ func (m *BoostService) processBellatrixPayload(w http.ResponseWriter, req *http.
 		return
 	}
 
+	if m.fiberClient != nil {
+		go func() {
+			// After the final checks, publish the block to Fiber
+			unblinded := UnblindBellatrixBlock(payload, result.Data)
+			sszUnblinded, err := unblinded.MarshalSSZ()
+			if err != nil {
+				log.WithError(err).Error("could not marshal unblinded block to SSZ")
+			} else {
+				// Only publish to Fiber if the ssz encoding was successful
+				m.PublishUnblindedBlockToFiber(sszUnblinded, log)
+			}
+		}()
+	}
+
 	m.respondOK(w, result)
 }
 
@@ -739,6 +784,20 @@ func (m *BoostService) processCapellaPayload(w http.ResponseWriter, req *http.Re
 		return
 	}
 
+	if m.fiberClient != nil {
+		go func() {
+			// After the final checks, publish the block to Fiber
+			unblinded := UnblindCapellaBlock(payload, result.Capella)
+			sszUnblinded, err := unblinded.MarshalSSZ()
+			if err != nil {
+				log.WithError(err).Error("could not marshal unblinded block to SSZ")
+			} else {
+				// Only publish to Fiber if the ssz encoding was successful
+				m.PublishUnblindedBlockToFiber(sszUnblinded, log)
+			}
+		}()
+	}
+
 	m.respondOK(w, result)
 }
 
@@ -804,4 +863,21 @@ func (m *BoostService) CheckRelays() int {
 	// At the end, wait for every routine and return status according to relay's ones.
 	wg.Wait()
 	return int(numSuccessRequestsToRelay)
+}
+
+// PublishUnblindedBlockToFiber publishes the given unblinded, SSZ-encoded block to the Fiber Network
+func (m *BoostService) PublishUnblindedBlockToFiber(unblinded []byte, log *logrus.Entry) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	slot, stateRoot, timestamp, err := m.fiberClient.SubmitBlock(ctx, unblinded)
+	if err != nil {
+		log.WithError(err).Error("could not submit block to fiber")
+	}
+
+	log.WithFields(logrus.Fields{
+		"slot":      slot,
+		"stateRoot": stateRoot,
+		"timestamp": timestamp,
+	}).Info("submitted block to fiber")
 }
