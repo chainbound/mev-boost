@@ -76,6 +76,10 @@ type BoostServiceOpts struct {
 	FiberApiKey   string
 }
 
+type BlockSubmitter interface {
+	SubmitBlock(context.Context, []byte) (uint64, []byte, uint64, error)
+}
+
 // BoostService - the mev-boost service
 type BoostService struct {
 	listenAddr    string
@@ -98,7 +102,8 @@ type BoostService struct {
 	slotUID     *slotUID
 	slotUIDLock sync.Mutex
 
-	fiberClient *fiber.Client
+	fiberClient BlockSubmitter
+	fiberActive bool
 }
 
 // NewBoostService created a new BoostService
@@ -112,21 +117,23 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 		return nil, err
 	}
 
-	fiberClient := fiber.NewClient(opts.FiberEndpoint, opts.FiberApiKey)
+	var fiberClient *fiber.Client
+	fiberActive := false
 
 	// If Fiber is enabled, connect to the Fiber Network, otherwise warn the user
 	// that Fiber is disabled and leave fiberClient as nil.
 	if opts.FiberApiKey == "" || opts.FiberEndpoint == "" {
 		opts.Log.Info("Fiber API key or endpoint not set, disabling Fiber")
-		// Set fiberClient = nil
-		fiberClient = nil
 	} else {
+		fiberClient = fiber.NewClient(opts.FiberEndpoint, opts.FiberApiKey)
 		// Try to connect to the Fiber Network. If unsuccessful, return an error.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := fiberClient.Connect(ctx); err != nil {
 			return nil, err
 		}
+
+		fiberActive = true
 
 		opts.Log.WithFields(logrus.Fields{
 			"endpoint": opts.FiberEndpoint,
@@ -160,6 +167,7 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 		requestMaxRetries: opts.RequestMaxRetries,
 
 		fiberClient: fiberClient,
+		fiberActive: fiberActive,
 	}, nil
 }
 
@@ -636,7 +644,7 @@ func (m *BoostService) processBellatrixPayload(w http.ResponseWriter, req *http.
 		return
 	}
 
-	if m.fiberClient != nil {
+	if m.fiberActive {
 		go func() {
 			// After the final checks, publish the block to Fiber
 			unblinded := UnblindBellatrixBlock(payload, result.Data)
@@ -784,7 +792,7 @@ func (m *BoostService) processCapellaPayload(w http.ResponseWriter, req *http.Re
 		return
 	}
 
-	if m.fiberClient != nil {
+	if m.fiberActive {
 		go func() {
 			// After the final checks, publish the block to Fiber
 			unblinded := UnblindCapellaBlock(payload, result.Capella)
@@ -797,6 +805,8 @@ func (m *BoostService) processCapellaPayload(w http.ResponseWriter, req *http.Re
 			}
 		}()
 	}
+
+	fmt.Println("result: ", result)
 
 	m.respondOK(w, result)
 }

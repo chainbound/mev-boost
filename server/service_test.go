@@ -63,6 +63,58 @@ func newTestBackend(t *testing.T, numRelays int, relayTimeout time.Duration) *te
 	return &backend
 }
 
+type fiberMock struct {
+	fiberBlockChan chan []byte
+}
+
+func (f *fiberMock) SubmitBlock(ctx context.Context, block []byte) (uint64, []byte, uint64, error) {
+	f.fiberBlockChan <- block
+
+	return 0, nil, 0, nil
+}
+
+// newTestBackendWithFiber creates a new backend, initializes mock relays, registers them,
+// creates a mocked Fiber client and returns the instance
+func newTestBackendWithFiber(t *testing.T, numRelays int, relayTimeout time.Duration, fiberBlockChan chan []byte) *testBackend {
+	t.Helper()
+	backend := testBackend{
+		relays: make([]*mockRelay, numRelays),
+	}
+
+	fiberMock := &fiberMock{
+		fiberBlockChan: fiberBlockChan,
+	}
+
+	relayEntries := make([]RelayEntry, numRelays)
+	for i := 0; i < numRelays; i++ {
+		// Create a mock relay
+		backend.relays[i] = newMockRelay(t)
+		relayEntries[i] = backend.relays[i].RelayEntry
+	}
+
+	opts := BoostServiceOpts{
+		Log:                      testLog,
+		ListenAddr:               "localhost:12345",
+		Relays:                   relayEntries,
+		GenesisForkVersionHex:    "0x00000000",
+		RelayCheck:               true,
+		RelayMinBid:              types.IntToU256(12345),
+		RequestTimeoutGetHeader:  relayTimeout,
+		RequestTimeoutGetPayload: relayTimeout,
+		RequestTimeoutRegVal:     relayTimeout,
+		RequestMaxRetries:        5,
+	}
+
+	service, err := NewBoostService(opts)
+	service.fiberClient = fiberMock
+	service.fiberActive = true
+
+	require.NoError(t, err)
+
+	backend.boost = service
+	return &backend
+}
+
 func (be *testBackend) request(t *testing.T, method, path string, payload any) *httptest.ResponseRecorder {
 	t.Helper()
 	var req *http.Request
@@ -119,6 +171,72 @@ func blindedBlockToExecutionPayloadCapella(signedBlindedBeaconBlock *apiv1capell
 		BlockHash:     header.BlockHash,
 		Transactions:  make([]bellatrix.Transaction, 0),
 		Withdrawals:   make([]*capella.Withdrawal, 0),
+	}
+}
+
+func beaconBlockToExecutionPayloadCapella(beaconBlock *capella.BeaconBlock) *capella.ExecutionPayload {
+	payload := beaconBlock.Body.ExecutionPayload
+
+	return &capella.ExecutionPayload{
+		ParentHash:    payload.ParentHash,
+		FeeRecipient:  payload.FeeRecipient,
+		StateRoot:     types.Hash(payload.StateRoot),
+		ReceiptsRoot:  types.Hash(payload.ReceiptsRoot),
+		LogsBloom:     types.Bloom(payload.LogsBloom),
+		PrevRandao:    payload.PrevRandao,
+		BlockNumber:   payload.BlockNumber,
+		GasLimit:      payload.GasLimit,
+		GasUsed:       payload.GasUsed,
+		Timestamp:     payload.Timestamp,
+		ExtraData:     payload.ExtraData,
+		BaseFeePerGas: payload.BaseFeePerGas,
+		BlockHash:     payload.BlockHash,
+		Transactions:  payload.Transactions,
+		Withdrawals:   payload.Withdrawals,
+	}
+}
+
+func beaconBlockToSignedBlinded(beaconBlock *capella.SignedBeaconBlock, txsRoot, withdrawalsRoot phase0.Root) *apiv1capella.SignedBlindedBeaconBlock {
+	signature := beaconBlock.Signature
+	blockBody := beaconBlock.Message
+
+	return &apiv1capella.SignedBlindedBeaconBlock{
+		Message: &apiv1capella.BlindedBeaconBlock{
+			Slot:          blockBody.Slot,
+			ProposerIndex: blockBody.ProposerIndex,
+			ParentRoot:    blockBody.ParentRoot,
+			StateRoot:     blockBody.StateRoot,
+			Body: &apiv1capella.BlindedBeaconBlockBody{
+				RANDAOReveal:      blockBody.Body.RANDAOReveal,
+				ETH1Data:          blockBody.Body.ETH1Data,
+				Graffiti:          blockBody.Body.Graffiti,
+				ProposerSlashings: blockBody.Body.ProposerSlashings,
+				AttesterSlashings: blockBody.Body.AttesterSlashings,
+				Attestations:      blockBody.Body.Attestations,
+				Deposits:          blockBody.Body.Deposits,
+				VoluntaryExits:    blockBody.Body.VoluntaryExits,
+				SyncAggregate:     blockBody.Body.SyncAggregate,
+				ExecutionPayloadHeader: &capella.ExecutionPayloadHeader{
+					ParentHash:       blockBody.Body.ExecutionPayload.ParentHash,
+					FeeRecipient:     blockBody.Body.ExecutionPayload.FeeRecipient,
+					StateRoot:        blockBody.Body.ExecutionPayload.StateRoot,
+					ReceiptsRoot:     blockBody.Body.ExecutionPayload.ReceiptsRoot,
+					LogsBloom:        blockBody.Body.ExecutionPayload.LogsBloom,
+					PrevRandao:       blockBody.Body.ExecutionPayload.PrevRandao,
+					BlockNumber:      blockBody.Body.ExecutionPayload.BlockNumber,
+					GasLimit:         blockBody.Body.ExecutionPayload.GasLimit,
+					GasUsed:          blockBody.Body.ExecutionPayload.GasUsed,
+					Timestamp:        blockBody.Body.ExecutionPayload.Timestamp,
+					ExtraData:        blockBody.Body.ExecutionPayload.ExtraData,
+					BaseFeePerGas:    blockBody.Body.ExecutionPayload.BaseFeePerGas,
+					BlockHash:        blockBody.Body.ExecutionPayload.BlockHash,
+					TransactionsRoot: txsRoot,
+					WithdrawalsRoot:  withdrawalsRoot,
+				},
+				BLSToExecutionChanges: blockBody.Body.BLSToExecutionChanges,
+			},
+		},
+		Signature: signature,
 	}
 }
 
@@ -908,6 +1026,58 @@ func TestGetPayloadWithTestdata(t *testing.T) {
 			require.Equal(t, signedBlindedBeaconBlock.Message.Body.ExecutionPayloadHeader.BlockHash, resp.Data.BlockHash)
 		})
 	}
+}
+
+// This test will first load a full SSZ block from testdata, then it will convert that to a blinded beacon block and an execution payload,
+// and then it will send the blinded beacon block to the backend and check that the response is the same as the execution payload.
+func TestGetPayloadCapellaBoostedWithTestdata(t *testing.T) {
+	path := "/eth/v1/builder/blinded_blocks"
+
+	sszPayloadFile := "../testdata/signed-mainnet-beacon-block.bin.ssz"
+
+	// The following values were queried from a synced ETH node:
+	// - Slot: 8223390
+	// - Block: 19027450
+	transactionsRoot := _HexToBytes("0x57d1381ca8cbf819812afaff9934d7e0b908146412d09828af40a05942e7c26f")
+	withdrawalsRoot := _HexToBytes("0xf2afa030ec731534d771967e06dc0fc1475f3bb74f8207f00647f2c635205a56")
+
+	t.Run(sszPayloadFile, func(t *testing.T) {
+		// Load the SSZ encoded full beacon block from the SSZ file
+		sszBytes, err := os.ReadFile(sszPayloadFile)
+		require.NoError(t, err)
+
+		beaconBlock := new(capella.SignedBeaconBlock)
+		err = beaconBlock.UnmarshalSSZ(sszBytes)
+		require.NoError(t, err)
+
+		// Convert the full beacon block to an execution payload + signed blinded beacon block
+		payload := beaconBlockToExecutionPayloadCapella(beaconBlock.Message)
+		signedBlinded := beaconBlockToSignedBlinded(beaconBlock, phase0.Root(transactionsRoot), phase0.Root(withdrawalsRoot))
+
+		// Channel that will receive SSZ encoded blocks from the mocked Fiber client
+		blockChan := make(chan []byte)
+
+		backend := newTestBackendWithFiber(t, 1, time.Second, blockChan)
+
+		backend.relays[0].GetCapellaPayloadResponse = &api.VersionedExecutionPayload{
+			Version: consensusspec.DataVersionCapella,
+			Capella: payload,
+		}
+
+		rr := backend.request(t, http.MethodPost, path, signedBlinded)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
+
+		resp := new(types.GetPayloadResponse)
+		err = json.Unmarshal(rr.Body.Bytes(), resp)
+		require.NoError(t, err)
+		require.Equal(t, signedBlinded.Message.Body.ExecutionPayloadHeader.BlockHash.String(), resp.Data.BlockHash.String())
+
+		sszRecv := <-blockChan
+		t.Log("Received ssz block:", len(sszRecv), "bytes")
+
+		require.Equal(t, sszBytes, sszRecv)
+	})
 }
 
 func TestGetPayloadCapella(t *testing.T) {
